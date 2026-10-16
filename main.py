@@ -337,7 +337,7 @@ def run(argv=None):
     parser.add_argument(
         "--input_subscription",
         required=True,
-        help="Subscription của Pub/Sub (Ví dụ: projects/PROJECT_ID/subscriptions/YOUR_SUBSCRIPTION_NAME)"
+        help="projects/bigdataproject-297/subscriptions/bd_gcs-file-events-sub"
     )
     known_args, pipeline_args = parser.parse_known_args(argv)
 
