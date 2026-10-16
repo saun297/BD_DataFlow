@@ -120,8 +120,8 @@ def read_gcs_file_content(element):
         return
 
     from google.cloud import storage
-    
-    # Khởi tạo storage client dùng credentials từ key JSON nếu có
+    from google.api_core.exceptions import NotFound
+
     if os.path.exists(KEY_FILE_NAME):
         creds = service_account.Credentials.from_service_account_file(KEY_FILE_NAME)
         client = storage.Client(credentials=creds, project=PROJECT_ID)
@@ -129,22 +129,34 @@ def read_gcs_file_content(element):
         client = storage.Client(project=PROJECT_ID)
 
     def load_jsonl(gcs_url):
-        bucket_name = gcs_url.split("/")[2]
-        blob_name = "/".join(gcs_url.split("/")[3:])
-        blob = client.bucket(bucket_name).blob(blob_name)
-        content = blob.download_as_text()
-        records = []
-        for line in content.splitlines():
-            line = line.strip()
-            if line:
-                try:
-                    records.append(json.loads(line))
-                except Exception:
-                    pass
-        return records
+        try:
+            bucket_name = gcs_url.split("/")[2]
+            blob_name = "/".join(gcs_url.split("/")[3:])
+            blob = client.bucket(bucket_name).blob(blob_name)
+            content = blob.download_as_text()
+            records = []
+            for line in content.splitlines():
+                line = line.strip()
+                if line:
+                    try:
+                        records.append(json.loads(line))
+                    except Exception:
+                        pass
+            return records
+        except NotFound:
+            logging.error("LỖI 404: Không tìm thấy file tại đường dẫn %s", gcs_url)
+            return []
+        except Exception as e:
+            logging.error("Lỗi khi đọc file GCS %s: %s", gcs_url, e)
+            return []
 
     videos = load_jsonl(video_path)
     comments = load_jsonl(comment_path)
+
+    # Nếu một trong hai file đọc thất bại do lỗi 404, bỏ qua batch này thay vì làm crash pipeline
+    if not videos or not comments:
+        logging.warning("Không thể đọc nội dung file video hoặc comment cho batch %s.", group_key)
+        return
 
     video_dict = {v.get("video_id"): v for v in videos if v.get("video_id")}
 
