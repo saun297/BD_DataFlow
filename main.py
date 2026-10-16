@@ -29,7 +29,7 @@ DATASET_ID = "bd_silver_dataset"
 TABLE_ID = "nlp_api_comments_sentiment"
 BIGQUERY_TABLE_SPEC = f"{PROJECT_ID}:{DATASET_ID}.{TABLE_ID}"
 
-# Tên file key JSON sẽ nằm cùng thư mục làm việc trên Dataflow Worker
+# Tên file key JSON dịch vụ (Service Account Key)
 KEY_FILE_NAME = "bigdataproject-297-0144fcafedf0.json"
 
 TABLE_SCHEMA = {
@@ -56,7 +56,7 @@ TABLE_SCHEMA = {
 }
 
 MAX_CHARS_PER_COMMENT = 1000
-BATCH_MIN, BATCH_MAX = 10, 30
+BATCH_MIN, BATCH_MAX = 5, 30
 
 API_RETRY = Retry(
     predicate=if_exception_type(
@@ -91,21 +91,35 @@ def parse_pubsub_message(element):
     try:
         data = json.loads(element.decode("utf-8"))
         bucket = data.get("bucket")
-        name = data.get("name")
+        name = data.get("name", "")
         
-        if bucket and name and name.endswith(".jsonl"):
+        # Chỉ nhận nếu là file dữ liệu (.jsonl hoặc .json)
+        if bucket and name and (name.endswith(".jsonl") or name.endswith(".json")):
             file_path = f"gs://{bucket}/{name}"
+            
+            # Trích xuất group_key theo run_ts (ví dụ: run_ts=20261016T153849Z)
             match = re.search(r"(run_ts=[^/]+)", name)
             group_key = match.group(1) if match else "default"
             
-            file_type = "video" if "video_snapshots" in name else ("comment" if "comments" in name else "other")
+            # Phân loại dựa trên cấu trúc thư mục GCS
+            if "/video_snapshots/" in name or "video_snapshots" in name:
+                file_type = "video"
+            elif "/comments/" in name or "comments" in name:
+                file_type = "comment"
+            else:
+                file_type = "other"
+                
+            logging.info("Parse PubSub OK: Group=%s | Type=%s | Path=%s", group_key, file_type, file_path)
             return [(group_key, {"type": file_type, "path": file_path})]
+        else:
+            logging.debug("Bỏ qua thông báo không phải file dữ liệu: %s", name)
     except Exception as e:
         logging.error("Lỗi parse tín hiệu PubSub: %s", e)
     return []
 
+
 def read_gcs_file_content(element):
-    """Tải nội dung từ GCS khi nhận đủ 2 file video và comment trong cửa sổ thời gian."""
+    """Tải nội dung từ GCS. Tự động liên kết video & comment nếu có."""
     group_key, files = element
     video_path, comment_path = None, None
     
@@ -115,8 +129,8 @@ def read_gcs_file_content(element):
         elif f["type"] == "comment":
             comment_path = f["path"]
             
-    if not video_path or not comment_path:
-        logging.warning("Chưa nhận đủ 2 file video & comment cho batch %s. Bỏ qua.", group_key)
+    if not comment_path and not video_path:
+        logging.warning("Batch %s không tìm thấy đường dẫn file hợp lệ.", group_key)
         return
 
     from google.cloud import storage
@@ -129,6 +143,8 @@ def read_gcs_file_content(element):
         client = storage.Client(project=PROJECT_ID)
 
     def load_jsonl(gcs_url):
+        if not gcs_url:
+            return []
         try:
             bucket_name = gcs_url.split("/")[2]
             blob_name = "/".join(gcs_url.split("/")[3:])
@@ -144,28 +160,33 @@ def read_gcs_file_content(element):
                         pass
             return records
         except NotFound:
-            logging.error("LỖI 404: Không tìm thấy file tại đường dẫn %s", gcs_url)
+            logging.error("LỖI 404: Không tìm thấy file tại %s", gcs_url)
             return []
         except Exception as e:
             logging.error("Lỗi khi đọc file GCS %s: %s", gcs_url, e)
             return []
 
-    videos = load_jsonl(video_path)
-    comments = load_jsonl(comment_path)
+    videos = load_jsonl(video_path) if video_path else []
+    comments = load_jsonl(comment_path) if comment_path else []
 
-    # Nếu một trong hai file đọc thất bại do lỗi 404, bỏ qua batch này thay vì làm crash pipeline
-    if not videos or not comments:
-        logging.warning("Không thể đọc nội dung file video hoặc comment cho batch %s.", group_key)
+    # Nếu chỉ có file video mà chưa có comment
+    if not comments:
+        logging.info("Batch %s chưa có file comment để xử lý.", group_key)
         return
 
     video_dict = {v.get("video_id"): v for v in videos if v.get("video_id")}
 
+    count = 0
     for comment in comments:
         v_id = comment.get("video_id")
         v_info = video_dict.get(v_id, {})
-        comment["channel_title"] = v_info.get("channel_title", "Unknown")
-        comment["video_title"] = v_info.get("video_title", "Unknown")
+        comment["channel_title"] = v_info.get("channel_title", comment.get("channel_title", "Unknown"))
+        comment["video_title"] = v_info.get("video_title", comment.get("video_title", "Unknown"))
+        count += 1
         yield comment
+
+    logging.info("--> ĐÃ XỬ LÝ VÀ PHÁT RA %d COMMENTS từ batch %s", count, group_key)
+
 
 def get_raw_text(record):
     for key in TEXT_FIELDS:
@@ -173,6 +194,7 @@ def get_raw_text(record):
         if val:
             return str(val)
     return ""
+
 
 class CleanTextFn(beam.DoFn):
     def process(self, record):
@@ -189,6 +211,7 @@ class CleanTextFn(beam.DoFn):
         record["cleaned_text"] = text
         yield record
 
+
 def extract_program_name(video_title, channel_title=None, existing_program=None):
     title = (video_title or "").lower()
     channel = (channel_title or "").lower()
@@ -204,6 +227,7 @@ def extract_program_name(video_title, channel_title=None, existing_program=None)
         return str(existing_program).strip()
     return "Chưa xác định"
 
+
 class AddProgramNameFn(beam.DoFn):
     def process(self, record):
         record["program_name"] = extract_program_name(
@@ -212,6 +236,7 @@ class AddProgramNameFn(beam.DoFn):
             record.get("program_name"),
         )
         yield record
+
 
 def score_to_probs(score, magnitude=1.0):
     if score is None:
@@ -242,17 +267,18 @@ def score_to_probs(score, magnitude=1.0):
 
     return label, pos, neg, neu
 
+
 class GoogleCloudNLPBatchFn(beam.DoFn):
     def setup(self):
-        """Khởi tạo Client dịch thuật và Natural Language sử dụng Service Account Key JSON."""
+        """Khởi tạo Client dịch thuật và Natural Language."""
         if os.path.exists(KEY_FILE_NAME):
             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = KEY_FILE_NAME
             creds = service_account.Credentials.from_service_account_file(KEY_FILE_NAME)
             self.translate_client = translate.Client(credentials=creds)
             self.nlp_client = language_v1.LanguageServiceClient(credentials=creds)
-            logging.info("Đã khởi tạo Translate & NLP Client với Service Account Key JSON thành công.")
+            logging.info("Đã khởi tạo Translate & NLP Client với Key JSON thành công.")
         else:
-            logging.warning("Không tìm thấy file %s trên Worker, khởi tạo với ADC mặc định.", KEY_FILE_NAME)
+            logging.warning("Không tìm thấy %s trên Worker, khởi tạo với ADC mặc định.", KEY_FILE_NAME)
             self.translate_client = translate.Client()
             self.nlp_client = language_v1.LanguageServiceClient()
 
@@ -341,6 +367,7 @@ class GoogleCloudNLPBatchFn(beam.DoFn):
                 })
                 yield row
 
+
 # =========================================================
 # MAIN PIPELINE
 # =========================================================
@@ -362,7 +389,7 @@ def run(argv=None):
             p
             | "Read From PubSub" >> beam.io.ReadFromPubSub(subscription=known_args.input_subscription)
             | "Parse Event Message" >> beam.FlatMap(parse_pubsub_message)
-            | "Fixed Window (30s)" >> beam.WindowInto(FixedWindows(30))
+            | "Fixed Window (120s)" >> beam.WindowInto(FixedWindows(120))
             | "Group Files By Batch" >> beam.GroupByKey()
             | "Read GCS File Contents" >> beam.FlatMap(read_gcs_file_content)
             | "Clean Text" >> beam.ParDo(CleanTextFn())
@@ -377,6 +404,7 @@ def run(argv=None):
                 method="STREAMING_INSERTS"
             )
         )
+
 
 if __name__ == "__main__":
     run()
