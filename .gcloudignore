@@ -1,0 +1,23 @@
+# 1. BẢO MẬT: Bỏ qua file Service Account Key JSON
+*.json
+!package*.json
+
+# 2. Môi trường ảo Python (Virtual Environment)
+.venv/
+venv/
+ENV/
+env/
+
+# 3. Cache & Compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# 4. VS Code & IDE settings
+.vscode/
+.idea/
+
+# 5. OS Generated Files
+.DS_Store
+Thumbs.db
