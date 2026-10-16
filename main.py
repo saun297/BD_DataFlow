@@ -87,34 +87,31 @@ ALIAS_DICT = {
 # FUNCS & DO-FNS
 # =========================================================
 def parse_pubsub_message(element):
-    """Trích xuất đường dẫn file GCS từ tín hiệu Event Pub/Sub."""
+    """Trích xuất đường dẫn file GCS và in log chi tiết."""
     try:
-        data = json.loads(element.decode("utf-8"))
+        payload_str = element.decode("utf-8")
+        data = json.loads(payload_str)
         bucket = data.get("bucket")
         name = data.get("name", "")
         
-        # Chỉ nhận nếu là file dữ liệu (.jsonl hoặc .json)
-        if bucket and name and (name.endswith(".jsonl") or name.endswith(".json")):
+        # Chỉ loại bỏ các event tạo folder rỗng (không có đuôi file)
+        if bucket and name and "." in name.split("/")[-1]:
             file_path = f"gs://{bucket}/{name}"
             
-            # Trích xuất group_key theo run_ts (ví dụ: run_ts=20261016T153849Z)
             match = re.search(r"(run_ts=[^/]+)", name)
             group_key = match.group(1) if match else "default"
             
-            # Phân loại dựa trên cấu trúc thư mục GCS
-            if "/video_snapshots/" in name or "video_snapshots" in name:
+            if "video_snapshots" in name:
                 file_type = "video"
-            elif "/comments/" in name or "comments" in name:
+            elif "comments" in name:
                 file_type = "comment"
             else:
                 file_type = "other"
                 
-            logging.info("Parse PubSub OK: Group=%s | Type=%s | Path=%s", group_key, file_type, file_path)
+            print(f">>> DATAFLOW GOT FILE: Group={group_key} | Type={file_type} | Path={file_path}")
             return [(group_key, {"type": file_type, "path": file_path})]
-        else:
-            logging.debug("Bỏ qua thông báo không phải file dữ liệu: %s", name)
     except Exception as e:
-        logging.error("Lỗi parse tín hiệu PubSub: %s", e)
+        print(f">>> PARSE ERROR: {e}")
     return []
 
 
