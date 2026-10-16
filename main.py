@@ -119,7 +119,7 @@ def parse_pubsub_message(element):
 
 
 def read_gcs_file_content(element):
-    """Tải nội dung từ GCS. Tự động liên kết video & comment nếu có."""
+    """Tải nội dung từ GCS tự động dùng Default Service Account của Worker."""
     group_key, files = element
     video_path, comment_path = None, None
     
@@ -136,11 +136,8 @@ def read_gcs_file_content(element):
     from google.cloud import storage
     from google.api_core.exceptions import NotFound
 
-    if os.path.exists(KEY_FILE_NAME):
-        creds = service_account.Credentials.from_service_account_file(KEY_FILE_NAME)
-        client = storage.Client(credentials=creds, project=PROJECT_ID)
-    else:
-        client = storage.Client(project=PROJECT_ID)
+    # Khởi tạo GCS Client tự động bằng App Default Credentials của Worker
+    client = storage.Client(project=PROJECT_ID)
 
     def load_jsonl(gcs_url):
         if not gcs_url:
@@ -149,7 +146,9 @@ def read_gcs_file_content(element):
             bucket_name = gcs_url.split("/")[2]
             blob_name = "/".join(gcs_url.split("/")[3:])
             blob = client.bucket(bucket_name).blob(blob_name)
-            content = blob.download_as_text()
+            
+            # Thêm timeout=30 giây để ngắt ngay nếu bị nghẽn mạng
+            content = blob.download_as_text(timeout=30)
             records = []
             for line in content.splitlines():
                 line = line.strip()
@@ -169,7 +168,6 @@ def read_gcs_file_content(element):
     videos = load_jsonl(video_path) if video_path else []
     comments = load_jsonl(comment_path) if comment_path else []
 
-    # Nếu chỉ có file video mà chưa có comment
     if not comments:
         logging.info("Batch %s chưa có file comment để xử lý.", group_key)
         return
